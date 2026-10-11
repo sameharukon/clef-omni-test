@@ -3,6 +3,8 @@
 [Clef-omni](https://developers.cloudflare.com/workers-ai/models/clef-omni/)（`@cf/cloudflare/clef-omni`）の音声入力を検証するための簡易アプリです。
 マイクで日本語の「右」「左」を話すと Clef-omni が方向を判定し、3 レーンを走る車が左右に移動します。
 
+検証の経過と結果は [docs/evaluation-report.md](docs/evaluation-report.md) にまとめています。
+
 ## 構成
 
 ```
