@@ -1,6 +1,9 @@
 // Clef-omni 音声方向判定 Worker
-// POST /api/direction  { audio: "data:audio/wav;base64,..." }
-//   -> { direction: "right" | "left" | "none", confidence, probabilities, latencyMs, raw }
+// POST /api/direction  { audio: "data:audio/wav;base64,...", mode?: "left" | "choice" }
+//   mode "left"（既定）: 「左」と言ったかを yes/no で判定し、左でなければ右とする
+//     -> { mode, direction: "left" | "right", pLeft, confidence, latencyMs, raw }
+//   mode "choice": 右 / 左 / なし の 3 択
+//     -> { mode, direction: "right" | "left" | "none", confidence, probabilities, latencyMs, raw }
 
 const MODEL = "@cf/cloudflare/clef-omni";
 const MAX_AUDIO_BYTES = 1024 * 1024; // 1 発話あたり 1 MiB まで（16kHz/16bit/mono で約 30 秒）
@@ -16,6 +19,14 @@ const DIRECTION_QUESTION = {
 		left: "The speaker said 「左」/「ひだり」 (hidari, left), possibly with words like 左へ or 左に",
 		none: "Neither direction was said: silence, background noise, or other words",
 	},
+};
+
+const LEFT_QUESTION = {
+	type: "noul",
+	instructions:
+		"The audio is one short Japanese voice command spoken to steer a car in a 3-lane game. " +
+		"Did the speaker say 「左」/「ひだり」 (hidari, meaning left), possibly with words like 左へ or 左に? " +
+		"Answer no for any other word, including 「右」/「みぎ」 (migi, right).",
 };
 
 export default {
@@ -50,6 +61,9 @@ async function handleDirection(request, env) {
 		return json({ error: "音声が大きすぎます" }, 413);
 	}
 
+	const mode = body.mode === "choice" ? "choice" : "left";
+	const question = mode === "choice" ? DIRECTION_QUESTION : LEFT_QUESTION;
+
 	const started = Date.now();
 	let result;
 	try {
@@ -57,7 +71,7 @@ async function handleDirection(request, env) {
 			model: "clef-omni",
 			state: "A player of a 3-lane car game spoke one Japanese voice command into the microphone.",
 			audio: [audio],
-			questions: { direction: DIRECTION_QUESTION },
+			questions: { direction: question },
 		});
 	} catch (err) {
 		return json({ error: `Clef-omni の呼び出しに失敗しました: ${err?.message ?? err}` }, 502);
@@ -65,7 +79,23 @@ async function handleDirection(request, env) {
 	const latencyMs = Date.now() - started;
 
 	const answer = result?.answers?.direction ?? {};
+	if (mode === "left") {
+		const pLeft = typeof answer.noul === "number" ? answer.noul : null;
+		if (pLeft === null) {
+			return json({ error: "Clef-omni の回答に noul（確率）が含まれていません", raw: answer }, 502);
+		}
+		return json({
+			mode,
+			direction: pLeft >= 0.5 ? "left" : "right",
+			pLeft,
+			confidence: Math.max(pLeft, 1 - pLeft),
+			latencyMs,
+			usage: result?.usage ?? null,
+			raw: answer,
+		});
+	}
 	return json({
+		mode,
 		direction: answer.choice ?? "none",
 		confidence: answer.confidence ?? null,
 		probabilities: answer.probabilities ?? null,

@@ -33,10 +33,13 @@ const rawEl = $("raw");
 const summaryEl = $("summary");
 const normalizeEl = $("normalize");
 const retriesEl = $("retries");
+const modeEl = $("mode");
+const leftThresholdEl = $("leftThreshold");
 
 const settings = {
 	threshold: Number(thresholdEl.value),
 	minConfidence: Number(minConfEl.value),
+	leftThreshold: Number(leftThresholdEl.value),
 };
 
 function bindRange(input, outputId, key) {
@@ -52,6 +55,16 @@ function bindRange(input, outputId, key) {
 }
 bindRange(thresholdEl, "thresholdValue", "threshold");
 bindRange(minConfEl, "minConfValue", "minConfidence");
+bindRange(leftThresholdEl, "leftThresholdValue", "leftThreshold");
+
+// 判定方式ごとに関係する設定だけを表示する
+function updateModeUi() {
+	const left = modeEl.value === "left";
+	$("leftOnly").hidden = !left;
+	$("choiceOnly").hidden = left;
+}
+modeEl.addEventListener("change", updateModeUi);
+updateModeUi();
 
 // ---------------------------------------------------------------------------
 // マイク入力と簡易 VAD（音量しきい値で発話区間を切り出す）
@@ -145,11 +158,12 @@ async function sendUtterance(samples, sampleRate, durationMs) {
 	let gain = 1;
 	if (normalizeEl.checked) ({ samples: pcm, gain } = normalizePeak(pcm));
 
-	const entry = addEntry({ durationMs, gain, normalized: normalizeEl.checked });
+	const mode = modeEl.value;
+	const entry = addEntry({ durationMs, gain, normalized: normalizeEl.checked, mode });
 	const requestedAt = performance.now();
 
 	try {
-		const first = await requestDirection(pcm, 0);
+		const first = await requestDirection(pcm, 0, mode);
 		entry.attempts.push(first);
 		if (!first.ok) {
 			entry.status = "error";
@@ -158,10 +172,11 @@ async function sendUtterance(samples, sampleRate, durationMs) {
 		}
 
 		const retries = Number(retriesEl.value);
-		if (retries > 0 && !isConfident(first.confidence)) {
+		// 左判定モードは常に右か左に決まるので再送しない
+		if (mode === "choice" && retries > 0 && !isConfident(first)) {
 			entry.retrying = true;
 			render();
-			const results = await Promise.all(RETRY_OFFSETS_MS.slice(0, retries).map((offset) => requestDirection(pcm, offset)));
+			const results = await Promise.all(RETRY_OFFSETS_MS.slice(0, retries).map((offset) => requestDirection(pcm, offset, mode)));
 			entry.attempts.push(...results);
 			entry.retrying = false;
 		}
@@ -170,10 +185,11 @@ async function sendUtterance(samples, sampleRate, durationMs) {
 		entry.status = "done";
 		entry.direction = best.direction;
 		entry.confidence = best.confidence;
+		entry.pLeft = best.pLeft;
 		entry.bestOffsetMs = best.offsetMs;
 		entry.response = best.response;
 		entry.modelMs = first.modelMs;
-		entry.accepted = isAccepted(best.direction, best.confidence);
+		entry.accepted = isAccepted(best);
 
 		if (entry.accepted) moveCar(best.direction === "right" ? 1 : -1);
 	} finally {
@@ -184,17 +200,17 @@ async function sendUtterance(samples, sampleRate, durationMs) {
 }
 
 /** 先頭に offsetMs の無音を足した音声で 1 回問い合わせる（失敗しても例外は投げない） */
-async function requestDirection(pcm, offsetMs) {
+async function requestDirection(pcm, offsetMs, mode) {
 	const pad = Math.round((offsetMs / 1000) * TARGET_SAMPLE_RATE);
 	const shifted = pad > 0 ? concatChunks([new Float32Array(pad), pcm]) : pcm;
 	const wav = encodeWav(shifted, TARGET_SAMPLE_RATE);
-	const attempt = { offsetMs, ok: false, direction: null, confidence: null, modelMs: null, error: null, response: null };
+	const attempt = { offsetMs, mode, ok: false, direction: null, confidence: null, pLeft: null, modelMs: null, error: null, response: null };
 
 	try {
 		const res = await fetch("/api/direction", {
 			method: "POST",
 			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ audio: toDataUrl(wav, "audio/wav") }),
+			body: JSON.stringify({ audio: toDataUrl(wav, "audio/wav"), mode }),
 		});
 		const data = await res.json();
 		attempt.response = data;
@@ -203,8 +219,15 @@ async function requestDirection(pcm, offsetMs) {
 			return attempt;
 		}
 		attempt.ok = true;
-		attempt.direction = data.direction;
-		attempt.confidence = typeof data.confidence === "number" ? data.confidence : null;
+		if (mode === "left") {
+			// 左の確率がしきい値以上なら左、そうでなければ右
+			attempt.pLeft = data.pLeft;
+			attempt.direction = data.pLeft >= settings.leftThreshold ? "left" : "right";
+			attempt.confidence = attempt.direction === "left" ? data.pLeft : 1 - data.pLeft;
+		} else {
+			attempt.direction = data.direction;
+			attempt.confidence = typeof data.confidence === "number" ? data.confidence : null;
+		}
 		attempt.modelMs = data.latencyMs ?? null;
 	} catch (err) {
 		attempt.error = `通信エラー: ${err.message}`;
@@ -212,18 +235,20 @@ async function requestDirection(pcm, offsetMs) {
 	return attempt;
 }
 
-function isConfident(confidence) {
-	return confidence === null || confidence >= settings.minConfidence;
+/** 3 択モードでは最低信頼度以上か。左判定モードは常に確定扱い */
+function isConfident(attempt) {
+	if (attempt.mode === "left") return true;
+	return attempt.confidence === null || attempt.confidence >= settings.minConfidence;
 }
 
-function isAccepted(direction, confidence) {
-	return (direction === "right" || direction === "left") && isConfident(confidence);
+function isAccepted(attempt) {
+	return (attempt.direction === "right" || attempt.direction === "left") && isConfident(attempt);
 }
 
 /** 採用できる結果を優先し、その中で最も信頼度が高いもの */
 function pickBest(attempts) {
 	const ok = attempts.filter((a) => a.ok);
-	const score = (a) => (isAccepted(a.direction, a.confidence) ? 1 : 0) * 10 + (a.confidence ?? 0);
+	const score = (a) => (isAccepted(a) ? 1 : 0) * 10 + (a.confidence ?? 0);
 	return ok.reduce((best, a) => (score(a) > score(best) ? a : best));
 }
 
@@ -233,6 +258,7 @@ function pickBest(attempts) {
 const MAX_ENTRIES = 200;
 const LABELS = { right: "右", left: "左", none: "なし" };
 const TRUTH_LABELS = { right: "右", left: "左", none: "他" };
+const MODE_LABELS = { left: "左判定", choice: "3択" };
 let entries = [];
 let nextId = 1;
 let selectedId = null;
@@ -252,6 +278,8 @@ function addEntry(fields) {
 		truth: null,
 		attempts: [],
 		retrying: false,
+		mode: "choice",
+		pLeft: null,
 		bestOffsetMs: 0,
 		...fields,
 	};
@@ -313,7 +341,7 @@ function renderRow(e) {
 	const outcome = outcomeOf(e);
 	if (e.truth && outcome) labelTd.classList.add(outcome === e.truth ? "mark-ok" : "mark-ng");
 
-	cell(e.confidence === null ? "-" : e.confidence.toFixed(2));
+	cell(e.pLeft !== null ? `P(左) ${e.pLeft.toFixed(2)}` : e.confidence === null ? "-" : e.confidence.toFixed(2));
 	cell(`${Math.round(e.durationMs)}ms` + (e.gain > 1 ? ` ×${e.gain.toFixed(1)}` : ""));
 	const retried = retriedCount(e);
 	cell(
@@ -372,9 +400,16 @@ function renderSummary() {
 	const rawOk = labeled.filter((e) => e.direction === e.truth);
 	const rawNg = labeled.filter((e) => e.direction !== e.truth);
 
+	const modeCounts = Object.entries(MODE_LABELS)
+		.map(([value, text]) => [text, labeled.filter((e) => e.mode === value).length])
+		.filter(([, n]) => n > 0)
+		.map(([text, n]) => `${text} ${n} 件`)
+		.join(" / ");
+
 	summaryEl.innerHTML = "";
 	const lines = [
-		[`正解率`, `${pct(correct, labeled.length)}`, `（${correct}/${labeled.length} 件、判定時の最低信頼度を適用）`],
+		[`判定方式`, modeCounts, ""],
+		[`正解率`, `${pct(correct, labeled.length)}`, `（${correct}/${labeled.length} 件、判定時の設定を適用）`],
 		[`誤判定（逆方向・他を右左と判定）`, `${misfire} 件`, ""],
 		[`取りこぼし（右左を不採用・なし）`, `${missed} 件`, ""],
 		[`再送`, `${retriedEntries.length} 件 → 採用 ${rescued.length} 件（うち正解 ${rescuedCorrect} 件）`, ""],
@@ -397,6 +432,7 @@ function showRaw(e) {
 		{
 			id: e.id,
 			time: e.time.toLocaleTimeString(),
+			mode: e.mode,
 			gain: e.gain,
 			truth: e.truth,
 			error: e.error,
@@ -438,6 +474,7 @@ const EXPORT_HEADER = [
 	"time", "direction", "confidence", "accepted", "outcome", "truth", "correct",
 	"duration_ms", "gain", "round_trip_ms", "model_ms", "error", "answer_json",
 	"first_direction", "first_confidence", "first_outcome", "retries", "best_offset_ms", "attempts_json",
+	"mode", "p_left",
 ];
 
 /** 古い順のエクスポート用行データ */
@@ -453,6 +490,7 @@ function exportRows() {
 			e.attempts.length > 1
 				? JSON.stringify(e.attempts.map((a) => ({ offset: a.offsetMs, choice: a.direction, confidence: a.confidence, probabilities: a.response?.probabilities, error: a.error ?? undefined })))
 				: "",
+			e.mode, e.pLeft,
 		];
 	});
 }

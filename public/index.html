@@ -30,16 +30,27 @@
 			<div class="meter"><div id="level"></div><div id="thresholdMark"></div></div>
 			<label>発話検出しきい値 <input id="threshold" type="range" min="0.005" max="0.2" step="0.005" value="0.03" />
 				<output id="thresholdValue">0.030</output></label>
-			<label>判定の最低信頼度 <input id="minConf" type="range" min="0" max="1" step="0.05" value="0.5" />
-				<output id="minConfValue">0.50</output></label>
-			<label><input id="normalize" type="checkbox" checked /> 送信前に音量を正規化する</label>
-			<label>信頼度不足のときの再送
-				<select id="retries">
-					<option value="0">しない</option>
-					<option value="1">1 回（38ms ずらす）</option>
-					<option value="2" selected>2 回（38 / 19ms ずらす、並列）</option>
-					<option value="3">3 回（38 / 19 / 58ms ずらす、並列）</option>
+			<label>判定方式
+				<select id="mode">
+					<option value="left" selected>左かどうか（左でなければ右）</option>
+					<option value="choice">3 択（右 / 左 / なし）</option>
 				</select></label>
+			<div id="leftOnly">
+				<label>左と判定する確率 <input id="leftThreshold" type="range" min="0.05" max="0.95" step="0.05" value="0.5" />
+					<output id="leftThresholdValue">0.50</output></label>
+			</div>
+			<div id="choiceOnly">
+				<label>判定の最低信頼度 <input id="minConf" type="range" min="0" max="1" step="0.05" value="0.5" />
+					<output id="minConfValue">0.50</output></label>
+				<label>信頼度不足のときの再送
+					<select id="retries">
+						<option value="0">しない</option>
+						<option value="1">1 回（38ms ずらす）</option>
+						<option value="2" selected>2 回（38 / 19ms ずらす、並列）</option>
+						<option value="3">3 回（38 / 19 / 58ms ずらす、並列）</option>
+					</select></label>
+			</div>
+			<label><input id="normalize" type="checkbox" checked /> 送信前に音量を正規化する</label>
 			<p id="vadState" class="vad">待機中</p>
 
 			<h2>正解率</h2>
