@@ -13,6 +13,9 @@ const MIN_VOICED_MS = 80; // これ未満はノイズとして捨てる
 const RETRY_OFFSETS_MS = [38, 19, 58];
 // 応答が返らない問い合わせを打ち切るまでの時間
 const REQUEST_TIMEOUT_MS = 5000;
+// Workers AI の料金表における clef-omni の換算（入力 100 万トークンあたり）
+const NEURONS_PER_M_INPUT_TOKENS = 13636;
+const USD_PER_M_INPUT_TOKENS = 0.15;
 
 const LANES = 3;
 const OBSTACLE_FALL_MS = 4500; // 障害物が画面上端から下端まで落ちる時間
@@ -227,7 +230,18 @@ async function requestDirection(pcm, offsetMs, mode) {
 	const pad = Math.round((offsetMs / 1000) * TARGET_SAMPLE_RATE);
 	const shifted = pad > 0 ? concatChunks([new Float32Array(pad), pcm]) : pcm;
 	const wav = encodeWav(shifted, TARGET_SAMPLE_RATE);
-	const attempt = { offsetMs, mode, ok: false, direction: null, confidence: null, pLeft: null, modelMs: null, error: null, response: null };
+	const attempt = {
+		offsetMs,
+		mode,
+		ok: false,
+		direction: null,
+		confidence: null,
+		pLeft: null,
+		modelMs: null,
+		inputTokens: null,
+		error: null,
+		response: null,
+	};
 
 	try {
 		const res = await fetch("/api/direction", {
@@ -253,6 +267,7 @@ async function requestDirection(pcm, offsetMs, mode) {
 			attempt.confidence = typeof data.confidence === "number" ? data.confidence : null;
 		}
 		attempt.modelMs = data.latencyMs ?? null;
+		attempt.inputTokens = data.usage?.input_tokens ?? null;
 	} catch (err) {
 		attempt.error =
 			err.name === "TimeoutError" ? `タイムアウト（${REQUEST_TIMEOUT_MS / 1000}秒）` : `通信エラー: ${err.message}`;
@@ -315,6 +330,14 @@ function addEntry(fields) {
 	return entry;
 }
 
+/** 1 判定で消費した入力トークン数（再送分を含む）。usage が 1 つも取れなければ null */
+function tokensOf(e) {
+	const values = e.attempts.map((a) => a.inputTokens).filter((t) => typeof t === "number");
+	return values.length ? values.reduce((a, b) => a + b, 0) : null;
+}
+
+const toNeurons = (tokens) => (tokens * NEURONS_PER_M_INPUT_TOKENS) / 1_000_000;
+
 /** ゲームに反映された結果（不採用は none 扱い） */
 function outcomeOf(e) {
 	if (e.status !== "done") return null;
@@ -376,6 +399,8 @@ function renderRow(e) {
 			? "-"
 			: `${e.roundTripMs}ms` + (e.modelMs != null ? ` (AI ${e.modelMs}ms)` : "") + (retried ? ` 再送${retried}` : ""),
 	);
+	const tokens = tokensOf(e);
+	cell(tokens === null ? "-" : `${tokens} / ${toNeurons(tokens).toFixed(2)}N`);
 
 	const truthTd = cell("");
 	const group = document.createElement("div");
@@ -414,8 +439,14 @@ function renderSummary() {
 	const labeled = entries.filter((e) => e.truth && e.status === "done");
 	const latency = latencyByMode();
 	const ignoredCount = entries.filter((e) => e.ignored).length;
+	const usage = usageSummary();
 	if (labeled.length === 0) {
-		summaryEl.textContent = latency ? `AI 処理時間: ${latency}` : "正解ラベル付きの判定はまだありません";
+		summaryEl.innerHTML = "";
+		appendSummaryLines([
+			["正解ラベル付きの判定はまだありません", "", ""],
+			...(latency ? [[`AI 処理時間`, latency, ""]] : []),
+			...(usage ? [[`使用量`, usage, ""]] : []),
+		]);
 		return;
 	}
 
@@ -466,14 +497,35 @@ function renderSummary() {
 		[`平均信頼度`, `正解時 ${avgConf(rawOk)} / 不正解時 ${avgConf(rawNg)}`, `（しきい値無視）`],
 		[`AI 処理時間`, latency, `（ラベルなしも含む）`],
 		[`遅延・順序逆転で車に反映しなかった判定`, `${ignoredCount} 件`, `（ラベルなしも含む。正解率は判定内容で集計）`],
+		[`使用量`, usage ?? "-", `（ラベルなしも含む）`],
 	];
+	appendSummaryLines(lines);
+}
+
+function appendSummaryLines(lines) {
 	for (const [head, value, tail] of lines) {
 		const div = document.createElement("div");
-		const strong = document.createElement("strong");
-		strong.textContent = value;
-		div.append(`${head}: `, strong, tail);
+		if (!value) {
+			div.textContent = head;
+		} else {
+			const strong = document.createElement("strong");
+			strong.textContent = value;
+			div.append(`${head}: `, strong, tail);
+		}
 		summaryEl.append(div);
 	}
+}
+
+/** ログ全体の入力トークン・Neurons・推定料金（再送分を含む） */
+function usageSummary() {
+	const counted = entries.map(tokensOf).filter((t) => t !== null);
+	if (counted.length === 0) return null;
+	const total = counted.reduce((a, b) => a + b, 0);
+	const usd = (total * USD_PER_M_INPUT_TOKENS) / 1_000_000;
+	return (
+		`累計 ${total} トークン / ${toNeurons(total).toFixed(1)} Neurons / 約 $${usd.toFixed(5)}` +
+		`（${counted.length} 判定、平均 ${Math.round(total / counted.length)} トークン）`
+	);
 }
 
 function showRaw(e) {
@@ -488,7 +540,13 @@ function showRaw(e) {
 			error: e.error,
 			bestOffsetMs: e.bestOffsetMs,
 			response: e.response,
-			attempts: e.attempts.map((a) => ({ offsetMs: a.offsetMs, error: a.error, answer: a.response?.raw ?? a.response })),
+			inputTokens: tokensOf(e),
+			attempts: e.attempts.map((a) => ({
+				offsetMs: a.offsetMs,
+				error: a.error,
+				inputTokens: a.inputTokens,
+				answer: a.response?.raw ?? a.response,
+			})),
 		},
 		null,
 		2,
@@ -524,7 +582,7 @@ const EXPORT_HEADER = [
 	"time", "direction", "confidence", "accepted", "outcome", "truth", "correct",
 	"duration_ms", "gain", "round_trip_ms", "model_ms", "error", "answer_json",
 	"first_direction", "first_confidence", "first_outcome", "retries", "best_offset_ms", "attempts_json",
-	"mode", "p_left", "ignored",
+	"mode", "p_left", "ignored", "input_tokens", "neurons",
 ];
 
 /** 古い順のエクスポート用行データ */
@@ -540,7 +598,7 @@ function exportRows() {
 			e.attempts.length > 1
 				? JSON.stringify(e.attempts.map((a) => ({ offset: a.offsetMs, choice: a.direction, confidence: a.confidence, probabilities: a.response?.probabilities, error: a.error ?? undefined })))
 				: "",
-			e.mode, e.pLeft, e.ignored,
+			e.mode, e.pLeft, e.ignored, tokensOf(e), tokensOf(e) === null ? null : toNeurons(tokensOf(e)).toFixed(3),
 		];
 	});
 }

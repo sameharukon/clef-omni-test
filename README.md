@@ -3,6 +3,8 @@
 [Clef-omni](https://developers.cloudflare.com/workers-ai/models/clef-omni/)（`@cf/cloudflare/clef-omni`）の音声入力を検証するための簡易アプリです。
 マイクで日本語の「右」「左」を話すと Clef-omni が方向を判定し、3 レーンを走る車が左右に移動します。
 
+![画面イメージ](docs/images/screenshot.png)
+
 検証の経過と結果は [docs/evaluation-report.md](docs/evaluation-report.md) にまとめています。
 
 ## 構成
@@ -65,7 +67,9 @@ npm run deploy   # workers.dev にデプロイ
 3. 「ゲーム開始」を押し、「右」「左」と話して落ちてくる障害物を避ける
    （←/→ キーでも操作できるため、音声判定と比較しながら検証できます）
 
-判定ログには、判定結果・信頼度・送信した発話の長さ（音量を正規化した場合は増幅率 `×n`）・往復遅延（括弧内は Worker で計測した Clef-omni の処理時間）が表示されます。
+判定ログには、判定結果・信頼度・送信した発話の長さ（音量を正規化した場合は増幅率 `×n`）・往復遅延（括弧内は Worker で計測した Clef-omni の処理時間）・
+入力トークン数と Neurons（レスポンスの `usage.input_tokens` から 100 万トークンあたり 13,636 Neurons で換算。再送分を含む）が表示されます。
+正解率欄には、ログ全体の累計トークン数・Neurons・推定料金も表示されます。
 行をクリックすると、その判定の Clef-omni の回答オブジェクトを「選択中のレスポンス (raw)」で確認できます。
 
 ## 精度の検証
