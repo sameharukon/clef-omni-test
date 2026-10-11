@@ -33,6 +33,13 @@
 			<label>判定の最低信頼度 <input id="minConf" type="range" min="0" max="1" step="0.05" value="0.5" />
 				<output id="minConfValue">0.50</output></label>
 			<label><input id="normalize" type="checkbox" checked /> 送信前に音量を正規化する</label>
+			<label>信頼度不足のときの再送
+				<select id="retries">
+					<option value="0">しない</option>
+					<option value="1">1 回（38ms ずらす）</option>
+					<option value="2" selected>2 回（38 / 19ms ずらす、並列）</option>
+					<option value="3">3 回（38 / 19 / 58ms ずらす、並列）</option>
+				</select></label>
 			<p id="vadState" class="vad">待機中</p>
 
 			<h2>正解率</h2>

@@ -8,6 +8,9 @@ const PRE_ROLL_MS = 250; // 発話開始直前も含めて送る
 const SILENCE_END_MS = 350; // この長さ無音が続いたら発話終了
 const MAX_UTTERANCE_MS = 1500; // 1 発話の最大長（発話前・発話後の無音を含む送信音声の長さ）
 const MIN_VOICED_MS = 80; // これ未満はノイズとして捨てる
+// 信頼度不足のとき、先頭に無音を足して音声トークン（約 77ms）の区切り位置をずらし再送する。
+// 1/2・1/4・3/4 トークン分のずれを、設定した回数ぶん並列に送る。
+const RETRY_OFFSETS_MS = [38, 19, 58];
 
 const LANES = 3;
 const OBSTACLE_FALL_MS = 4500; // 障害物が画面上端から下端まで落ちる時間
@@ -29,6 +32,7 @@ const logEl = $("log");
 const rawEl = $("raw");
 const summaryEl = $("summary");
 const normalizeEl = $("normalize");
+const retriesEl = $("retries");
 
 const settings = {
 	threshold: Number(thresholdEl.value),
@@ -140,10 +144,51 @@ async function sendUtterance(samples, sampleRate, durationMs) {
 	let pcm = downsample(samples, sampleRate, TARGET_SAMPLE_RATE);
 	let gain = 1;
 	if (normalizeEl.checked) ({ samples: pcm, gain } = normalizePeak(pcm));
-	const wav = encodeWav(pcm, TARGET_SAMPLE_RATE);
 
 	const entry = addEntry({ durationMs, gain, normalized: normalizeEl.checked });
 	const requestedAt = performance.now();
+
+	try {
+		const first = await requestDirection(pcm, 0);
+		entry.attempts.push(first);
+		if (!first.ok) {
+			entry.status = "error";
+			entry.error = first.error;
+			return;
+		}
+
+		const retries = Number(retriesEl.value);
+		if (retries > 0 && !isConfident(first.confidence)) {
+			entry.retrying = true;
+			render();
+			const results = await Promise.all(RETRY_OFFSETS_MS.slice(0, retries).map((offset) => requestDirection(pcm, offset)));
+			entry.attempts.push(...results);
+			entry.retrying = false;
+		}
+
+		const best = pickBest(entry.attempts);
+		entry.status = "done";
+		entry.direction = best.direction;
+		entry.confidence = best.confidence;
+		entry.bestOffsetMs = best.offsetMs;
+		entry.response = best.response;
+		entry.modelMs = first.modelMs;
+		entry.accepted = isAccepted(best.direction, best.confidence);
+
+		if (entry.accepted) moveCar(best.direction === "right" ? 1 : -1);
+	} finally {
+		entry.roundTripMs = Math.round(performance.now() - requestedAt);
+		if (selectedId === entry.id) showRaw(entry);
+		render();
+	}
+}
+
+/** 先頭に offsetMs の無音を足した音声で 1 回問い合わせる（失敗しても例外は投げない） */
+async function requestDirection(pcm, offsetMs) {
+	const pad = Math.round((offsetMs / 1000) * TARGET_SAMPLE_RATE);
+	const shifted = pad > 0 ? concatChunks([new Float32Array(pad), pcm]) : pcm;
+	const wav = encodeWav(shifted, TARGET_SAMPLE_RATE);
+	const attempt = { offsetMs, ok: false, direction: null, confidence: null, modelMs: null, error: null, response: null };
 
 	try {
 		const res = await fetch("/api/direction", {
@@ -152,31 +197,34 @@ async function sendUtterance(samples, sampleRate, durationMs) {
 			body: JSON.stringify({ audio: toDataUrl(wav, "audio/wav") }),
 		});
 		const data = await res.json();
-		entry.roundTripMs = Math.round(performance.now() - requestedAt);
-		entry.response = data;
-
+		attempt.response = data;
 		if (!res.ok) {
-			entry.status = "error";
-			entry.error = data.error ?? `HTTP ${res.status}`;
-			return;
+			attempt.error = data.error ?? `HTTP ${res.status}`;
+			return attempt;
 		}
-
-		entry.status = "done";
-		entry.direction = data.direction;
-		entry.confidence = typeof data.confidence === "number" ? data.confidence : null;
-		entry.modelMs = data.latencyMs ?? null;
-		entry.accepted =
-			(data.direction === "right" || data.direction === "left") &&
-			(entry.confidence === null || entry.confidence >= settings.minConfidence);
-
-		if (entry.accepted) moveCar(data.direction === "right" ? 1 : -1);
+		attempt.ok = true;
+		attempt.direction = data.direction;
+		attempt.confidence = typeof data.confidence === "number" ? data.confidence : null;
+		attempt.modelMs = data.latencyMs ?? null;
 	} catch (err) {
-		entry.status = "error";
-		entry.error = `通信エラー: ${err.message}`;
-	} finally {
-		if (selectedId === entry.id) showRaw(entry);
-		render();
+		attempt.error = `通信エラー: ${err.message}`;
 	}
+	return attempt;
+}
+
+function isConfident(confidence) {
+	return confidence === null || confidence >= settings.minConfidence;
+}
+
+function isAccepted(direction, confidence) {
+	return (direction === "right" || direction === "left") && isConfident(confidence);
+}
+
+/** 採用できる結果を優先し、その中で最も信頼度が高いもの */
+function pickBest(attempts) {
+	const ok = attempts.filter((a) => a.ok);
+	const score = (a) => (isAccepted(a.direction, a.confidence) ? 1 : 0) * 10 + (a.confidence ?? 0);
+	return ok.reduce((best, a) => (score(a) > score(best) ? a : best));
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +250,9 @@ function addEntry(fields) {
 		error: null,
 		response: null,
 		truth: null,
+		attempts: [],
+		retrying: false,
+		bestOffsetMs: 0,
 		...fields,
 	};
 	entries.unshift(entry);
@@ -214,6 +265,16 @@ function addEntry(fields) {
 function outcomeOf(e) {
 	if (e.status !== "done") return null;
 	return e.accepted ? e.direction : "none";
+}
+
+/** 再送しなかった場合の結果（再送したのは初回が信頼度不足だったときなので、初回だけなら不採用） */
+function firstOutcomeOf(e) {
+	if (e.status !== "done") return null;
+	return e.attempts.length > 1 ? "none" : outcomeOf(e);
+}
+
+function retriedCount(e) {
+	return Math.max(0, e.attempts.length - 1);
 }
 
 function render() {
@@ -236,7 +297,7 @@ function renderRow(e) {
 
 	cell(e.time.toLocaleTimeString());
 
-	let label = "判定中…";
+	let label = e.retrying ? "再送中…" : "判定中…";
 	let cls = "";
 	if (e.status === "error") {
 		label = e.error;
@@ -245,6 +306,7 @@ function renderRow(e) {
 		const name = LABELS[e.direction] ?? e.direction;
 		const rejected = !e.accepted && e.direction !== "none";
 		label = rejected ? `${name}（信頼度不足で無視）` : name;
+		if (e.accepted && e.bestOffsetMs > 0) label += "（再送で判定）";
 		cls = e.accepted ? e.direction : "none";
 	}
 	const labelTd = cell(label, cls);
@@ -253,7 +315,12 @@ function renderRow(e) {
 
 	cell(e.confidence === null ? "-" : e.confidence.toFixed(2));
 	cell(`${Math.round(e.durationMs)}ms` + (e.gain > 1 ? ` ×${e.gain.toFixed(1)}` : ""));
-	cell(e.roundTripMs === null ? "-" : `${e.roundTripMs}ms` + (e.modelMs != null ? ` (AI ${e.modelMs}ms)` : ""));
+	const retried = retriedCount(e);
+	cell(
+		e.roundTripMs === null
+			? "-"
+			: `${e.roundTripMs}ms` + (e.modelMs != null ? ` (AI ${e.modelMs}ms)` : "") + (retried ? ` 再送${retried}` : ""),
+	);
 
 	const truthTd = cell("");
 	const group = document.createElement("div");
@@ -297,6 +364,11 @@ function renderSummary() {
 		const values = list.map((e) => e.confidence).filter((c) => c !== null);
 		return values.length ? (values.reduce((a, b) => a + b, 0) / values.length).toFixed(2) : "-";
 	};
+	const retriedEntries = labeled.filter((e) => retriedCount(e) > 0);
+	const rescued = retriedEntries.filter((e) => e.accepted);
+	const rescuedCorrect = rescued.filter((e) => e.direction === e.truth).length;
+	const firstCorrect = labeled.filter((e) => firstOutcomeOf(e) === e.truth).length;
+
 	const rawOk = labeled.filter((e) => e.direction === e.truth);
 	const rawNg = labeled.filter((e) => e.direction !== e.truth);
 
@@ -305,6 +377,8 @@ function renderSummary() {
 		[`正解率`, `${pct(correct, labeled.length)}`, `（${correct}/${labeled.length} 件、判定時の最低信頼度を適用）`],
 		[`誤判定（逆方向・他を右左と判定）`, `${misfire} 件`, ""],
 		[`取りこぼし（右左を不採用・なし）`, `${missed} 件`, ""],
+		[`再送`, `${retriedEntries.length} 件 → 採用 ${rescued.length} 件（うち正解 ${rescuedCorrect} 件）`, ""],
+		[`再送なしの場合の正解率`, pct(firstCorrect, labeled.length), `（初回の問い合わせだけで判定した場合）`],
 		[`内訳`, perTruth, ""],
 		[`モデル判定そのものの正解率`, pct(rawCorrect, labeled.length), `（しきい値無視）`],
 		[`平均信頼度`, `正解時 ${avgConf(rawOk)} / 不正解時 ${avgConf(rawNg)}`, `（しきい値無視）`],
@@ -320,7 +394,16 @@ function renderSummary() {
 
 function showRaw(e) {
 	rawEl.textContent = JSON.stringify(
-		{ id: e.id, time: e.time.toLocaleTimeString(), gain: e.gain, truth: e.truth, error: e.error, response: e.response },
+		{
+			id: e.id,
+			time: e.time.toLocaleTimeString(),
+			gain: e.gain,
+			truth: e.truth,
+			error: e.error,
+			bestOffsetMs: e.bestOffsetMs,
+			response: e.response,
+			attempts: e.attempts.map((a) => ({ offsetMs: a.offsetMs, error: a.error, answer: a.response?.raw ?? a.response })),
+		},
 		null,
 		2,
 	);
@@ -354,6 +437,7 @@ $("clearBtn").addEventListener("click", () => {
 const EXPORT_HEADER = [
 	"time", "direction", "confidence", "accepted", "outcome", "truth", "correct",
 	"duration_ms", "gain", "round_trip_ms", "model_ms", "error", "answer_json",
+	"first_direction", "first_confidence", "first_outcome", "retries", "best_offset_ms", "attempts_json",
 ];
 
 /** 古い順のエクスポート用行データ */
@@ -365,6 +449,10 @@ function exportRows() {
 			e.truth && outcome ? outcome === e.truth : "",
 			Math.round(e.durationMs), e.gain.toFixed(2), e.roundTripMs, e.modelMs, e.error,
 			e.response?.raw ? JSON.stringify(e.response.raw) : "",
+			e.attempts[0]?.direction, e.attempts[0]?.confidence, firstOutcomeOf(e), retriedCount(e), e.bestOffsetMs,
+			e.attempts.length > 1
+				? JSON.stringify(e.attempts.map((a) => ({ offset: a.offsetMs, choice: a.direction, confidence: a.confidence, probabilities: a.response?.probabilities, error: a.error ?? undefined })))
+				: "",
 		];
 	});
 }
