@@ -1,0 +1,110 @@
+:root {
+	--bg: #f5f6f8;
+	--fg: #1d2330;
+	--muted: #5d6676;
+	--panel: #ffffff;
+	--border: #d9dde5;
+	--accent: #f6821f;
+	--ok: #1f9d55;
+	--ng: #c0392b;
+}
+
+@media (prefers-color-scheme: dark) {
+	:root {
+		--bg: #12151b;
+		--fg: #e6e9ef;
+		--muted: #9aa3b2;
+		--panel: #1b2029;
+		--border: #2c3340;
+	}
+}
+
+* { box-sizing: border-box; }
+
+body {
+	margin: 0;
+	padding: 16px;
+	background: var(--bg);
+	color: var(--fg);
+	font-family: system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif;
+}
+
+header h1 { margin: 0 0 4px; font-size: 1.4rem; }
+.sub { margin: 0 0 16px; color: var(--muted); font-size: 0.9rem; }
+
+main {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 16px;
+	align-items: flex-start;
+}
+
+.game, .panel {
+	background: var(--panel);
+	border: 1px solid var(--border);
+	border-radius: 8px;
+	padding: 12px;
+}
+
+.game { flex: 0 0 auto; }
+.panel { flex: 1 1 320px; min-width: 0; }
+
+canvas {
+	display: block;
+	max-width: 100%;
+	border-radius: 4px;
+	background: #3a3f4a;
+}
+
+.hud, .buttons {
+	display: flex;
+	justify-content: space-between;
+	gap: 8px;
+	margin-top: 8px;
+}
+
+button {
+	flex: 1;
+	padding: 8px 12px;
+	border: 1px solid var(--border);
+	border-radius: 6px;
+	background: var(--accent);
+	color: #fff;
+	font-weight: 600;
+	cursor: pointer;
+}
+button.active { background: var(--ng); }
+
+h2 { font-size: 1rem; margin: 8px 0; }
+
+label { display: block; margin: 6px 0; font-size: 0.9rem; }
+input[type="range"] { vertical-align: middle; width: 140px; }
+
+.meter {
+	position: relative;
+	height: 12px;
+	background: var(--bg);
+	border: 1px solid var(--border);
+	border-radius: 6px;
+	overflow: hidden;
+}
+#level { height: 100%; width: 0; background: var(--ok); transition: width 50ms linear; }
+#thresholdMark { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--ng); }
+
+.vad { font-size: 0.9rem; color: var(--muted); }
+.vad.speaking { color: var(--ng); font-weight: 600; }
+
+table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+th, td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--border); }
+td.right { color: var(--ok); font-weight: 600; }
+td.left { color: var(--accent); font-weight: 600; }
+td.none, td.error { color: var(--muted); }
+
+pre {
+	max-height: 200px;
+	overflow: auto;
+	font-size: 0.75rem;
+	background: var(--bg);
+	padding: 8px;
+	border-radius: 4px;
+}
