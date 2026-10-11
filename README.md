@@ -103,9 +103,26 @@ Workers AI の処理時間は時間帯によってばらつき、1 秒を超え�
 
 反映しなかった判定もログ・正解率の集計には残り、判定欄に理由が表示されます。正解率欄の「AI 処理時間」で判定方式ごとの中央値と 1 秒超の件数を確認できます。
 
+## Clef-omni のレスポンス（実測）
+
+`env.AI.run()` の戻り値のうち、本アプリが使うフィールドは次のとおりです（検証時の実際のレスポンスより）。
+
+```jsonc
+// noul 型（左判定）: noul は「yes」の確率
+{ "answers": { "direction": { "type": "noul", "noul": 0.018 } },
+  "usage": { "input_tokens": 205, "output_tokens": 0 } }
+
+// choice 型（3 択）: choice は最も確率の高い選択肢、probabilities は選択肢ごとの確率
+{ "answers": { "direction": { "type": "choice", "choice": "right",
+    "probabilities": { "right": 0.9509, "left": 0.0256, "none": 0.0235 }, "confidence": 0.8582 } } }
+```
+
+- `usage.input_tokens` は音声を含む入力トークン数で、課金の対象。`output_tokens` は 0。
+- choice 型の `confidence` は選んだ選択肢の確率ではなく、確率分布の偏りを表す値で、
+  選択肢数を k として `(Σ pᵢ² − 1/k) / (1 − 1/k)` と一致する（ログからの逆算。公式ドキュメントでの記載は未確認）。
+  詳しくは [検証レポート](docs/evaluation-report.md) の 4.1 を参照。
+
 ## 注意事項
 
-- `choice` 回答のうち本アプリが使うのは `choice` と `confidence` です。選択肢ごとの確率は `probabilities` として転送していますが、
-  フィールド名はドキュメントで明示されていないため、実際の値は raw 表示で確認してください。
 - 1 発話あたりの音声は Worker 側で 1 MiB までに制限しています（Clef-omni 自体の上限は 1 クリップ 8 MiB / 300 秒）。
 - 料金は入力トークン課金（$0.15 / 100 万トークン）です。音声はトークンに換算されて課金されます。
