@@ -18,7 +18,7 @@ wrangler.jsonc          Workers AI バインディング(AI)と静的アセッ�
 
 ## 処理の流れ
 
-1. ブラウザでマイク音声を取得し、音量しきい値で 1 発話を切り出す（発話前 250ms を含め、無音 350ms で終了、最大 2 秒）
+1. ブラウザでマイク音声を取得し、音量しきい値で 1 発話を切り出す（発話前 250ms を含め、無音 350ms で終了、最大 1.5 秒）
 2. 16kHz / 16bit / モノラルの WAV に変換し、base64 data URL で `POST /api/direction` に送信
 3. Worker が Clef-omni に `choice` 型の質問（`right` / `left` / `none`）として問い合わせ
 4. 返ってきた `choice` と `confidence` を画面に表示し、信頼度がしきい値以上なら車を移動

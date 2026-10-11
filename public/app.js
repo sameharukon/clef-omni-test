@@ -6,7 +6,7 @@ import { concatChunks, downsample, encodeWav, rms, toDataUrl } from "./audio.js"
 const TARGET_SAMPLE_RATE = 16000;
 const PRE_ROLL_MS = 250; // 発話開始直前も含めて送る
 const SILENCE_END_MS = 350; // この長さ無音が続いたら発話終了
-const MAX_UTTERANCE_MS = 2000; // 1 発話の最大長
+const MAX_UTTERANCE_MS = 1500; // 1 発話の最大長（発話前・発話後の無音を含む送信音声の長さ）
 const MIN_VOICED_MS = 80; // これ未満はノイズとして捨てる
 
 const LANES = 3;
