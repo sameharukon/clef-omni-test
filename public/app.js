@@ -8,9 +8,6 @@ const PRE_ROLL_MS = 250; // 発話開始直前も含めて送る
 const SILENCE_END_MS = 350; // この長さ無音が続いたら発話終了
 const MAX_UTTERANCE_MS = 1500; // 1 発話の最大長（発話前・発話後の無音を含む送信音声の長さ）
 const MIN_VOICED_MS = 80; // これ未満はノイズとして捨てる
-// 信頼度不足のとき、先頭に無音を足して音声トークン（約 77ms）の区切り位置をずらし再送する。
-// 1/2・1/4・3/4 トークン分のずれを、設定した回数ぶん並列に送る。
-const RETRY_OFFSETS_MS = [38, 19, 58];
 // 応答が返らない問い合わせを打ち切るまでの時間
 const REQUEST_TIMEOUT_MS = 5000;
 // Workers AI の料金表における clef-omni の換算（入力 100 万トークンあたり）
@@ -37,7 +34,6 @@ const logEl = $("log");
 const rawEl = $("raw");
 const summaryEl = $("summary");
 const normalizeEl = $("normalize");
-const retriesEl = $("retries");
 const modeEl = $("mode");
 const leftThresholdEl = $("leftThreshold");
 const maxDelayEl = $("maxDelay");
@@ -171,35 +167,8 @@ async function sendUtterance(samples, sampleRate, durationMs) {
 	const requestedAt = performance.now();
 
 	try {
-		const first = await requestDirection(pcm, 0, mode);
-		entry.attempts.push(first);
-		if (!first.ok) {
-			entry.status = "error";
-			entry.error = first.error;
-			return;
-		}
-
-		const retries = Number(retriesEl.value);
-		// 左判定モードは常に右か左に決まるので再送しない
-		if (mode === "choice" && retries > 0 && !isConfident(first)) {
-			entry.retrying = true;
-			render();
-			const results = await Promise.all(RETRY_OFFSETS_MS.slice(0, retries).map((offset) => requestDirection(pcm, offset, mode)));
-			entry.attempts.push(...results);
-			entry.retrying = false;
-		}
-
-		const best = pickBest(entry.attempts);
-		entry.status = "done";
-		entry.direction = best.direction;
-		entry.confidence = best.confidence;
-		entry.pLeft = best.pLeft;
-		entry.bestOffsetMs = best.offsetMs;
-		entry.response = best.response;
-		entry.modelMs = first.modelMs;
-		entry.accepted = isAccepted(best);
-
-		if (entry.accepted) applyToCar(entry, performance.now() - requestedAt);
+		await requestDirection(entry, encodeWav(pcm, TARGET_SAMPLE_RATE));
+		if (entry.status === "done" && entry.accepted) applyToCar(entry, performance.now() - requestedAt);
 	} finally {
 		entry.roundTripMs = Math.round(performance.now() - requestedAt);
 		if (selectedId === entry.id) showRaw(entry);
@@ -225,71 +194,47 @@ function applyToCar(entry, elapsedMs) {
 	moveCar(entry.direction === "right" ? 1 : -1);
 }
 
-/** 先頭に offsetMs の無音を足した音声で 1 回問い合わせる（失敗しても例外は投げない） */
-async function requestDirection(pcm, offsetMs, mode) {
-	const pad = Math.round((offsetMs / 1000) * TARGET_SAMPLE_RATE);
-	const shifted = pad > 0 ? concatChunks([new Float32Array(pad), pcm]) : pcm;
-	const wav = encodeWav(shifted, TARGET_SAMPLE_RATE);
-	const attempt = {
-		offsetMs,
-		mode,
-		ok: false,
-		direction: null,
-		confidence: null,
-		pLeft: null,
-		modelMs: null,
-		inputTokens: null,
-		error: null,
-		response: null,
-	};
-
+/** 1 回問い合わせ、結果を entry に書き込む（失敗しても例外は投げない） */
+async function requestDirection(entry, wav) {
 	try {
 		const res = await fetch("/api/direction", {
 			method: "POST",
 			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ audio: toDataUrl(wav, "audio/wav"), mode }),
+			body: JSON.stringify({ audio: toDataUrl(wav, "audio/wav"), mode: entry.mode }),
 			signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
 		});
 		const data = await res.json();
-		attempt.response = data;
+		entry.response = data;
 		if (!res.ok) {
-			attempt.error = data.error ?? `HTTP ${res.status}`;
-			return attempt;
+			entry.status = "error";
+			entry.error = data.error ?? `HTTP ${res.status}`;
+			return;
 		}
-		attempt.ok = true;
-		if (mode === "left") {
+		if (entry.mode === "left") {
 			// 左の確率がしきい値以上なら左、そうでなければ右
-			attempt.pLeft = data.pLeft;
-			attempt.direction = data.pLeft >= settings.leftThreshold ? "left" : "right";
-			attempt.confidence = attempt.direction === "left" ? data.pLeft : 1 - data.pLeft;
+			entry.pLeft = data.pLeft;
+			entry.direction = data.pLeft >= settings.leftThreshold ? "left" : "right";
+			entry.confidence = entry.direction === "left" ? data.pLeft : 1 - data.pLeft;
 		} else {
-			attempt.direction = data.direction;
-			attempt.confidence = typeof data.confidence === "number" ? data.confidence : null;
+			entry.direction = data.direction;
+			entry.confidence = typeof data.confidence === "number" ? data.confidence : null;
 		}
-		attempt.modelMs = data.latencyMs ?? null;
-		attempt.inputTokens = data.usage?.input_tokens ?? null;
+		entry.modelMs = data.latencyMs ?? null;
+		entry.inputTokens = data.usage?.input_tokens ?? null;
+		entry.accepted = isAccepted(entry);
+		entry.status = "done";
 	} catch (err) {
-		attempt.error =
+		entry.status = "error";
+		entry.error =
 			err.name === "TimeoutError" ? `タイムアウト（${REQUEST_TIMEOUT_MS / 1000}秒）` : `通信エラー: ${err.message}`;
 	}
-	return attempt;
 }
 
-/** 3 択モードでは最低信頼度以上か。左判定モードは常に確定扱い */
-function isConfident(attempt) {
-	if (attempt.mode === "left") return true;
-	return attempt.confidence === null || attempt.confidence >= settings.minConfidence;
-}
-
-function isAccepted(attempt) {
-	return (attempt.direction === "right" || attempt.direction === "left") && isConfident(attempt);
-}
-
-/** 採用できる結果を優先し、その中で最も信頼度が高いもの */
-function pickBest(attempts) {
-	const ok = attempts.filter((a) => a.ok);
-	const score = (a) => (isAccepted(a) ? 1 : 0) * 10 + (a.confidence ?? 0);
-	return ok.reduce((best, a) => (score(a) > score(best) ? a : best));
+/** 右か左に決まり、3 択モードでは最低信頼度以上か（左判定モードは常に確定扱い） */
+function isAccepted(e) {
+	if (e.direction !== "right" && e.direction !== "left") return false;
+	if (e.mode === "left") return true;
+	return e.confidence === null || e.confidence >= settings.minConfidence;
 }
 
 // ---------------------------------------------------------------------------
@@ -316,12 +261,10 @@ function addEntry(fields) {
 		error: null,
 		response: null,
 		truth: null,
-		attempts: [],
-		retrying: false,
 		mode: "choice",
 		pLeft: null,
+		inputTokens: null,
 		ignored: null, // 判定は採用されたが車に反映しなかった理由
-		bestOffsetMs: 0,
 		...fields,
 	};
 	entries.unshift(entry);
@@ -330,28 +273,12 @@ function addEntry(fields) {
 	return entry;
 }
 
-/** 1 判定で消費した入力トークン数（再送分を含む）。usage が 1 つも取れなければ null */
-function tokensOf(e) {
-	const values = e.attempts.map((a) => a.inputTokens).filter((t) => typeof t === "number");
-	return values.length ? values.reduce((a, b) => a + b, 0) : null;
-}
-
 const toNeurons = (tokens) => (tokens * NEURONS_PER_M_INPUT_TOKENS) / 1_000_000;
 
 /** ゲームに反映された結果（不採用は none 扱い） */
 function outcomeOf(e) {
 	if (e.status !== "done") return null;
 	return e.accepted ? e.direction : "none";
-}
-
-/** 再送しなかった場合の結果（再送したのは初回が信頼度不足だったときなので、初回だけなら不採用） */
-function firstOutcomeOf(e) {
-	if (e.status !== "done") return null;
-	return e.attempts.length > 1 ? "none" : outcomeOf(e);
-}
-
-function retriedCount(e) {
-	return Math.max(0, e.attempts.length - 1);
 }
 
 function render() {
@@ -374,7 +301,7 @@ function renderRow(e) {
 
 	cell(e.time.toLocaleTimeString());
 
-	let label = e.retrying ? "再送中…" : "判定中…";
+	let label = "判定中…";
 	let cls = "";
 	if (e.status === "error") {
 		label = e.error;
@@ -383,7 +310,6 @@ function renderRow(e) {
 		const name = LABELS[e.direction] ?? e.direction;
 		const rejected = !e.accepted && e.direction !== "none";
 		label = rejected ? `${name}（信頼度不足で無視）` : name;
-		if (e.accepted && e.bestOffsetMs > 0) label += "（再送で判定）";
 		if (e.ignored) label += `（${e.ignored}のため無視）`;
 		cls = e.accepted && !e.ignored ? e.direction : "none";
 	}
@@ -393,14 +319,12 @@ function renderRow(e) {
 
 	cell(e.pLeft !== null ? `P(左) ${e.pLeft.toFixed(2)}` : e.confidence === null ? "-" : e.confidence.toFixed(2));
 	cell(`${Math.round(e.durationMs)}ms` + (e.gain > 1 ? ` ×${e.gain.toFixed(1)}` : ""));
-	const retried = retriedCount(e);
 	cell(
 		e.roundTripMs === null
 			? "-"
-			: `${e.roundTripMs}ms` + (e.modelMs != null ? ` (AI ${e.modelMs}ms)` : "") + (retried ? ` 再送${retried}` : ""),
+			: `${e.roundTripMs}ms` + (e.modelMs != null ? ` (AI ${e.modelMs}ms)` : ""),
 	);
-	const tokens = tokensOf(e);
-	cell(tokens === null ? "-" : `${tokens} / ${toNeurons(tokens).toFixed(2)}N`);
+	cell(e.inputTokens === null ? "-" : `${e.inputTokens} / ${toNeurons(e.inputTokens).toFixed(2)}N`);
 
 	const truthTd = cell("");
 	const group = document.createElement("div");
@@ -470,11 +394,6 @@ function renderSummary() {
 		const values = list.map((e) => e.confidence).filter((c) => c !== null);
 		return values.length ? (values.reduce((a, b) => a + b, 0) / values.length).toFixed(2) : "-";
 	};
-	const retriedEntries = labeled.filter((e) => retriedCount(e) > 0);
-	const rescued = retriedEntries.filter((e) => e.accepted);
-	const rescuedCorrect = rescued.filter((e) => e.direction === e.truth).length;
-	const firstCorrect = labeled.filter((e) => firstOutcomeOf(e) === e.truth).length;
-
 	const rawOk = labeled.filter((e) => e.direction === e.truth);
 	const rawNg = labeled.filter((e) => e.direction !== e.truth);
 
@@ -490,8 +409,6 @@ function renderSummary() {
 		[`正解率`, `${pct(correct, labeled.length)}`, `（${correct}/${labeled.length} 件、判定時の設定を適用）`],
 		[`誤判定（逆方向・他を右左と判定）`, `${misfire} 件`, ""],
 		[`取りこぼし（右左を不採用・なし）`, `${missed} 件`, ""],
-		[`再送`, `${retriedEntries.length} 件 → 採用 ${rescued.length} 件（うち正解 ${rescuedCorrect} 件）`, ""],
-		[`再送なしの場合の正解率`, pct(firstCorrect, labeled.length), `（初回の問い合わせだけで判定した場合）`],
 		[`内訳`, perTruth, ""],
 		[`モデル判定そのものの正解率`, pct(rawCorrect, labeled.length), `（しきい値無視）`],
 		[`平均信頼度`, `正解時 ${avgConf(rawOk)} / 不正解時 ${avgConf(rawNg)}`, `（しきい値無視）`],
@@ -516,9 +433,9 @@ function appendSummaryLines(lines) {
 	}
 }
 
-/** ログ全体の入力トークン・Neurons・推定料金（再送分を含む） */
+/** ログ全体の入力トークン・Neurons・推定料金 */
 function usageSummary() {
-	const counted = entries.map(tokensOf).filter((t) => t !== null);
+	const counted = entries.map((e) => e.inputTokens).filter((t) => t !== null);
 	if (counted.length === 0) return null;
 	const total = counted.reduce((a, b) => a + b, 0);
 	const usd = (total * USD_PER_M_INPUT_TOKENS) / 1_000_000;
@@ -538,15 +455,7 @@ function showRaw(e) {
 			gain: e.gain,
 			truth: e.truth,
 			error: e.error,
-			bestOffsetMs: e.bestOffsetMs,
 			response: e.response,
-			inputTokens: tokensOf(e),
-			attempts: e.attempts.map((a) => ({
-				offsetMs: a.offsetMs,
-				error: a.error,
-				inputTokens: a.inputTokens,
-				answer: a.response?.raw ?? a.response,
-			})),
 		},
 		null,
 		2,
@@ -581,7 +490,6 @@ $("clearBtn").addEventListener("click", () => {
 const EXPORT_HEADER = [
 	"time", "direction", "confidence", "accepted", "outcome", "truth", "correct",
 	"duration_ms", "gain", "round_trip_ms", "model_ms", "error", "answer_json",
-	"first_direction", "first_confidence", "first_outcome", "retries", "best_offset_ms", "attempts_json",
 	"mode", "p_left", "ignored", "input_tokens", "neurons",
 ];
 
@@ -594,11 +502,7 @@ function exportRows() {
 			e.truth && outcome ? outcome === e.truth : "",
 			Math.round(e.durationMs), e.gain.toFixed(2), e.roundTripMs, e.modelMs, e.error,
 			e.response?.raw ? JSON.stringify(e.response.raw) : "",
-			e.attempts[0]?.direction, e.attempts[0]?.confidence, firstOutcomeOf(e), retriedCount(e), e.bestOffsetMs,
-			e.attempts.length > 1
-				? JSON.stringify(e.attempts.map((a) => ({ offset: a.offsetMs, choice: a.direction, confidence: a.confidence, probabilities: a.response?.probabilities, error: a.error ?? undefined })))
-				: "",
-			e.mode, e.pLeft, e.ignored, tokensOf(e), tokensOf(e) === null ? null : toNeurons(tokensOf(e)).toFixed(3),
+			e.mode, e.pLeft, e.ignored, e.inputTokens, e.inputTokens === null ? null : toNeurons(e.inputTokens).toFixed(3),
 		];
 	});
 }
