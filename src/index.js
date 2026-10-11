@@ -1,6 +1,8 @@
 // Clef-omni 音声方向判定 Worker
-// POST /api/direction  { audio: "data:audio/wav;base64,...", mode?: "left" | "choice" }
-//   mode "left"（既定）: 「左」と言ったかを yes/no で判定し、左でなければ右とする
+// POST /api/direction  { audio: "data:audio/wav;base64,...", mode?: "left" | "left-choice" | "choice" }
+//   mode "left"（既定）: 「左」と言ったかを noul（yes/no）で判定し、左でなければ右とする
+//     -> { mode, direction: "left" | "right", pLeft, confidence, latencyMs, raw }
+//   mode "left-choice": 同じ判定を choice（左 / それ以外の 2 択）で行う（noul との速度比較用）
 //     -> { mode, direction: "left" | "right", pLeft, confidence, latencyMs, raw }
 //   mode "choice": 右 / 左 / なし の 3 択
 //     -> { mode, direction: "right" | "left" | "none", confidence, probabilities, latencyMs, raw }
@@ -9,24 +11,33 @@ const MODEL = "@cf/cloudflare/clef-omni";
 const MAX_AUDIO_BYTES = 1024 * 1024; // 1 発話あたり 1 MiB まで（16kHz/16bit/mono で約 30 秒）
 const AUDIO_DATA_URL = /^data:audio\/(wav|x-wav|wave|mpeg);base64,[A-Za-z0-9+/]+=*$/;
 
-const DIRECTION_QUESTION = {
-	type: "choice",
-	instructions:
-		"The audio is one short Japanese voice command spoken to steer a car in a 3-lane game. " +
-		"Which direction did the speaker say? 「右」(migi) means right and 「左」(hidari) means left.",
-	criteria: {
-		right: "The speaker said 「右」/「みぎ」 (migi, right), possibly with words like 右へ or 右に",
-		left: "The speaker said 「左」/「ひだり」 (hidari, left), possibly with words like 左へ or 左に",
-		none: "Neither direction was said: silence, background noise, or other words",
-	},
-};
+const STATE = "A short Japanese voice command.";
 
-const LEFT_QUESTION = {
-	type: "noul",
-	instructions:
-		"The audio is one short Japanese voice command spoken to steer a car in a 3-lane game. " +
-		"Did the speaker say 「左」/「ひだり」 (hidari, meaning left), possibly with words like 左へ or 左に? " +
-		"Answer no for any other word, including 「右」/「みぎ」 (migi, right).",
+const LEFT_WORD = "「左」/「ひだり」 (hidari, left), possibly with 左へ or 左に";
+const RIGHT_WORD = "「右」/「みぎ」 (migi, right), possibly with 右へ or 右に";
+
+const QUESTIONS = {
+	left: {
+		type: "noul",
+		instructions: `Did the speaker say ${LEFT_WORD}? Answer no for any other word, including 「右」/「みぎ」 (migi, right).`,
+	},
+	"left-choice": {
+		type: "choice",
+		instructions: "Did the speaker say 「左」/「ひだり」 (hidari, left)?",
+		criteria: {
+			left: `The speaker said ${LEFT_WORD}`,
+			other: "Any other word, including 「右」/「みぎ」 (migi, right), or noise",
+		},
+	},
+	choice: {
+		type: "choice",
+		instructions: "Which direction did the speaker say?",
+		criteria: {
+			right: `The speaker said ${RIGHT_WORD}`,
+			left: `The speaker said ${LEFT_WORD}`,
+			none: "Neither: silence, noise, or other words",
+		},
+	},
 };
 
 export default {
@@ -61,17 +72,16 @@ async function handleDirection(request, env) {
 		return json({ error: "音声が大きすぎます" }, 413);
 	}
 
-	const mode = body.mode === "choice" ? "choice" : "left";
-	const question = mode === "choice" ? DIRECTION_QUESTION : LEFT_QUESTION;
+	const mode = Object.hasOwn(QUESTIONS, body.mode) ? body.mode : "left";
 
 	const started = Date.now();
 	let result;
 	try {
 		result = await env.AI.run(MODEL, {
 			model: "clef-omni",
-			state: "A player of a 3-lane car game spoke one Japanese voice command into the microphone.",
+			state: STATE,
 			audio: [audio],
-			questions: { direction: question },
+			questions: { direction: QUESTIONS[mode] },
 		});
 	} catch (err) {
 		return json({ error: `Clef-omni の呼び出しに失敗しました: ${err?.message ?? err}` }, 502);
@@ -79,10 +89,10 @@ async function handleDirection(request, env) {
 	const latencyMs = Date.now() - started;
 
 	const answer = result?.answers?.direction ?? {};
-	if (mode === "left") {
-		const pLeft = typeof answer.noul === "number" ? answer.noul : null;
-		if (pLeft === null) {
-			return json({ error: "Clef-omni の回答に noul（確率）が含まれていません", raw: answer }, 502);
+	if (mode === "left" || mode === "left-choice") {
+		const pLeft = mode === "left" ? answer.noul : answer.probabilities?.left;
+		if (typeof pLeft !== "number") {
+			return json({ error: "Clef-omni の回答に左の確率が含まれていません", raw: answer }, 502);
 		}
 		return json({
 			mode,

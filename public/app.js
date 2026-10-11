@@ -57,9 +57,14 @@ bindRange(thresholdEl, "thresholdValue", "threshold");
 bindRange(minConfEl, "minConfValue", "minConfidence");
 bindRange(leftThresholdEl, "leftThresholdValue", "leftThreshold");
 
+/** 左かどうかを判定し、左でなければ右とする方式か（noul 型 / choice 型） */
+function isLeftMode(mode) {
+	return mode === "left" || mode === "left-choice";
+}
+
 // 判定方式ごとに関係する設定だけを表示する
 function updateModeUi() {
-	const left = modeEl.value === "left";
+	const left = isLeftMode(modeEl.value);
 	$("leftOnly").hidden = !left;
 	$("choiceOnly").hidden = left;
 }
@@ -219,7 +224,7 @@ async function requestDirection(pcm, offsetMs, mode) {
 			return attempt;
 		}
 		attempt.ok = true;
-		if (mode === "left") {
+		if (isLeftMode(mode)) {
 			// 左の確率がしきい値以上なら左、そうでなければ右
 			attempt.pLeft = data.pLeft;
 			attempt.direction = data.pLeft >= settings.leftThreshold ? "left" : "right";
@@ -237,7 +242,7 @@ async function requestDirection(pcm, offsetMs, mode) {
 
 /** 3 択モードでは最低信頼度以上か。左判定モードは常に確定扱い */
 function isConfident(attempt) {
-	if (attempt.mode === "left") return true;
+	if (isLeftMode(attempt.mode)) return true;
 	return attempt.confidence === null || attempt.confidence >= settings.minConfidence;
 }
 
@@ -258,7 +263,7 @@ function pickBest(attempts) {
 const MAX_ENTRIES = 200;
 const LABELS = { right: "右", left: "左", none: "なし" };
 const TRUTH_LABELS = { right: "右", left: "左", none: "他" };
-const MODE_LABELS = { left: "左判定", choice: "3択" };
+const MODE_LABELS = { left: "左判定(noul)", "left-choice": "左判定(choice)", choice: "3択" };
 let entries = [];
 let nextId = 1;
 let selectedId = null;
@@ -365,10 +370,29 @@ function renderRow(e) {
 	return tr;
 }
 
+/** 判定方式ごとの AI 処理時間（初回の問い合わせ、中央値と 1 秒超の件数） */
+function latencyByMode() {
+	return Object.entries(MODE_LABELS)
+		.map(([value, text]) => {
+			const ms = entries
+				.filter((e) => e.status === "done" && e.mode === value && e.modelMs != null)
+				.map((e) => e.modelMs)
+				.sort((a, b) => a - b);
+			if (ms.length === 0) return null;
+			const mid = Math.floor(ms.length / 2);
+			const median = ms.length % 2 ? ms[mid] : Math.round((ms[mid - 1] + ms[mid]) / 2);
+			const slow = ms.filter((v) => v > 1000).length;
+			return `${text} 中央値 ${median}ms・1秒超 ${slow}/${ms.length} 件`;
+		})
+		.filter(Boolean)
+		.join(" / ");
+}
+
 function renderSummary() {
 	const labeled = entries.filter((e) => e.truth && e.status === "done");
+	const latency = latencyByMode();
 	if (labeled.length === 0) {
-		summaryEl.textContent = "正解ラベル付きの判定はまだありません";
+		summaryEl.textContent = latency ? `AI 処理時間: ${latency}` : "正解ラベル付きの判定はまだありません";
 		return;
 	}
 
@@ -417,6 +441,7 @@ function renderSummary() {
 		[`内訳`, perTruth, ""],
 		[`モデル判定そのものの正解率`, pct(rawCorrect, labeled.length), `（しきい値無視）`],
 		[`平均信頼度`, `正解時 ${avgConf(rawOk)} / 不正解時 ${avgConf(rawNg)}`, `（しきい値無視）`],
+		[`AI 処理時間`, latency, `（ラベルなしも含む）`],
 	];
 	for (const [head, value, tail] of lines) {
 		const div = document.createElement("div");

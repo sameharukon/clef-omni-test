@@ -21,22 +21,23 @@ wrangler.jsonc          Workers AI バインディング(AI)と静的アセッ�
 1. ブラウザでマイク音声を取得し、音量しきい値で 1 発話を切り出す（発話前 250ms を含め、無音 350ms で終了、最大 1.5 秒）
 2. 16kHz / 16bit / モノラルの WAV に変換し（オプションで音量を正規化）、base64 data URL で `POST /api/direction` に送信
 3. Worker が Clef-omni に問い合わせる（判定方式は画面で切り替え）
-   - **左かどうか（既定）**: `noul` 型の質問で「左と言ったか」の確率 `P(左)` を求め、「左と判定する確率」以上なら左、そうでなければ右
+   - **左かどうか（既定）**: `noul` 型（または比較用の `choice` 型 2 択）の質問で「左と言ったか」の確率 `P(左)` を求め、「左と判定する確率」以上なら左、そうでなければ右
    - **3 択**: `choice` 型の質問（`right` / `left` / `none`）で判定し、信頼度が「判定の最低信頼度」以上なら採用
 4. 判定結果に従って車を移動
 
-Worker から Clef-omni へのリクエストは次の形です。
+Worker から Clef-omni へのリクエストは次の形です（判定に不要な文脈は入れず、`state` は最小限）。
 
 ```js
 await env.AI.run("@cf/cloudflare/clef-omni", {
   model: "clef-omni",
-  state: "A player of a 3-lane car game spoke one Japanese voice command into the microphone.",
+  state: "A short Japanese voice command.",
   audio: ["data:audio/wav;base64,..."],
   questions: {
     direction: {
-      type: "choice",
-      instructions: "... 「右」(migi) means right and 「左」(hidari) means left.",
-      criteria: { right: "...", left: "...", none: "..." },
+      type: "noul",
+      instructions:
+        "Did the speaker say 「左」/「ひだり」 (hidari, left), possibly with 左へ or 左に? " +
+        "Answer no for any other word, including 「右」/「みぎ」 (migi, right).",
     },
   },
 });
@@ -82,6 +83,9 @@ npm run deploy   # workers.dev にデプロイ
 「左かどうか」だけを判定し、左でなければ右とする方式を既定にしています。
 この方式は常に右か左に決まるため、雑音や右・左以外の発話も「右」として扱われます（発話区間の検出で拾った音だけが対象）。
 判定ログの信頼度欄には `P(左)` を表示します。
+
+「左かどうか」には、`noul` 型（既定）と、同じ判定を `choice` 型（左 / それ以外の 2 択）で行う速度比較用の方式があります。
+正解率欄の「AI 処理時間」に、判定方式ごとの中央値と 1 秒を超えた件数が表示されます。
 
 ## 信頼度不足時の再送（3 択のみ）
 
