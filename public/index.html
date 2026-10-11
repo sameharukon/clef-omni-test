@@ -32,8 +32,7 @@
 				<output id="thresholdValue">0.030</output></label>
 			<label>判定方式
 				<select id="mode">
-					<option value="left" selected>左かどうか・noul 型（左でなければ右）</option>
-					<option value="left-choice">左かどうか・choice 型（速度比較用）</option>
+					<option value="left" selected>左かどうか（左でなければ右）</option>
 					<option value="choice">3 択（右 / 左 / なし）</option>
 				</select></label>
 			<div id="leftOnly">
@@ -51,6 +50,8 @@
 						<option value="3">3 回（38 / 19 / 58ms ずらす、並列）</option>
 					</select></label>
 			</div>
+			<label>結果を反映する最大遅延 <input id="maxDelay" type="range" min="300" max="3000" step="100" value="1000" />
+				<output id="maxDelayValue">1000ms</output></label>
 			<label><input id="normalize" type="checkbox" checked /> 送信前に音量を正規化する</label>
 			<p id="vadState" class="vad">待機中</p>
 

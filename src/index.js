@@ -1,8 +1,6 @@
 // Clef-omni 音声方向判定 Worker
-// POST /api/direction  { audio: "data:audio/wav;base64,...", mode?: "left" | "left-choice" | "choice" }
+// POST /api/direction  { audio: "data:audio/wav;base64,...", mode?: "left" | "choice" }
 //   mode "left"（既定）: 「左」と言ったかを noul（yes/no）で判定し、左でなければ右とする
-//     -> { mode, direction: "left" | "right", pLeft, confidence, latencyMs, raw }
-//   mode "left-choice": 同じ判定を choice（左 / それ以外の 2 択）で行う（noul との速度比較用）
 //     -> { mode, direction: "left" | "right", pLeft, confidence, latencyMs, raw }
 //   mode "choice": 右 / 左 / なし の 3 択
 //     -> { mode, direction: "right" | "left" | "none", confidence, probabilities, latencyMs, raw }
@@ -20,14 +18,6 @@ const QUESTIONS = {
 	left: {
 		type: "noul",
 		instructions: `Did the speaker say ${LEFT_WORD}? Answer no for any other word, including 「右」/「みぎ」 (migi, right).`,
-	},
-	"left-choice": {
-		type: "choice",
-		instructions: "Did the speaker say 「左」/「ひだり」 (hidari, left)?",
-		criteria: {
-			left: `The speaker said ${LEFT_WORD}`,
-			other: "Any other word, including 「右」/「みぎ」 (migi, right), or noise",
-		},
 	},
 	choice: {
 		type: "choice",
@@ -89,10 +79,10 @@ async function handleDirection(request, env) {
 	const latencyMs = Date.now() - started;
 
 	const answer = result?.answers?.direction ?? {};
-	if (mode === "left" || mode === "left-choice") {
-		const pLeft = mode === "left" ? answer.noul : answer.probabilities?.left;
+	if (mode === "left") {
+		const pLeft = answer.noul;
 		if (typeof pLeft !== "number") {
-			return json({ error: "Clef-omni の回答に左の確率が含まれていません", raw: answer }, 502);
+			return json({ error: "Clef-omni の回答に noul（確率）が含まれていません", raw: answer }, 502);
 		}
 		return json({
 			mode,

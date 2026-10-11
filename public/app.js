@@ -11,6 +11,8 @@ const MIN_VOICED_MS = 80; // これ未満はノイズとして捨てる
 // 信頼度不足のとき、先頭に無音を足して音声トークン（約 77ms）の区切り位置をずらし再送する。
 // 1/2・1/4・3/4 トークン分のずれを、設定した回数ぶん並列に送る。
 const RETRY_OFFSETS_MS = [38, 19, 58];
+// 応答が返らない問い合わせを打ち切るまでの時間
+const REQUEST_TIMEOUT_MS = 5000;
 
 const LANES = 3;
 const OBSTACLE_FALL_MS = 4500; // 障害物が画面上端から下端まで落ちる時間
@@ -35,17 +37,19 @@ const normalizeEl = $("normalize");
 const retriesEl = $("retries");
 const modeEl = $("mode");
 const leftThresholdEl = $("leftThreshold");
+const maxDelayEl = $("maxDelay");
 
 const settings = {
 	threshold: Number(thresholdEl.value),
 	minConfidence: Number(minConfEl.value),
 	leftThreshold: Number(leftThresholdEl.value),
+	maxDelayMs: Number(maxDelayEl.value),
 };
 
-function bindRange(input, outputId, key) {
+function bindRange(input, outputId, key, format = (v) => v.toFixed(2)) {
 	const update = () => {
 		settings[key] = Number(input.value);
-		$(outputId).textContent = settings[key].toFixed(key === "threshold" ? 3 : 2);
+		$(outputId).textContent = format(settings[key]);
 		if (key === "threshold") {
 			$("thresholdMark").style.left = `${Math.min(100, (settings.threshold / 0.2) * 100)}%`;
 		}
@@ -53,18 +57,14 @@ function bindRange(input, outputId, key) {
 	input.addEventListener("input", update);
 	update();
 }
-bindRange(thresholdEl, "thresholdValue", "threshold");
+bindRange(thresholdEl, "thresholdValue", "threshold", (v) => v.toFixed(3));
 bindRange(minConfEl, "minConfValue", "minConfidence");
 bindRange(leftThresholdEl, "leftThresholdValue", "leftThreshold");
-
-/** 左かどうかを判定し、左でなければ右とする方式か（noul 型 / choice 型） */
-function isLeftMode(mode) {
-	return mode === "left" || mode === "left-choice";
-}
+bindRange(maxDelayEl, "maxDelayValue", "maxDelayMs", (v) => `${v}ms`);
 
 // 判定方式ごとに関係する設定だけを表示する
 function updateModeUi() {
-	const left = isLeftMode(modeEl.value);
+	const left = modeEl.value === "left";
 	$("leftOnly").hidden = !left;
 	$("choiceOnly").hidden = left;
 }
@@ -196,12 +196,30 @@ async function sendUtterance(samples, sampleRate, durationMs) {
 		entry.modelMs = first.modelMs;
 		entry.accepted = isAccepted(best);
 
-		if (entry.accepted) moveCar(best.direction === "right" ? 1 : -1);
+		if (entry.accepted) applyToCar(entry, performance.now() - requestedAt);
 	} finally {
 		entry.roundTripMs = Math.round(performance.now() - requestedAt);
 		if (selectedId === entry.id) showRaw(entry);
 		render();
 	}
+}
+
+/**
+ * 判定結果を車に反映する。遅れて返ってきた結果や、後の発話より遅れて届いた結果は
+ * 操作として不自然なので反映しない（判定自体はログ・集計に残す）。
+ */
+let lastAppliedId = 0;
+function applyToCar(entry, elapsedMs) {
+	if (elapsedMs > settings.maxDelayMs) {
+		entry.ignored = `遅延（${Math.round(elapsedMs)}ms）`;
+		return;
+	}
+	if (entry.id < lastAppliedId) {
+		entry.ignored = "後の発話を反映済み";
+		return;
+	}
+	lastAppliedId = entry.id;
+	moveCar(entry.direction === "right" ? 1 : -1);
 }
 
 /** 先頭に offsetMs の無音を足した音声で 1 回問い合わせる（失敗しても例外は投げない） */
@@ -216,6 +234,7 @@ async function requestDirection(pcm, offsetMs, mode) {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify({ audio: toDataUrl(wav, "audio/wav"), mode }),
+			signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
 		});
 		const data = await res.json();
 		attempt.response = data;
@@ -224,7 +243,7 @@ async function requestDirection(pcm, offsetMs, mode) {
 			return attempt;
 		}
 		attempt.ok = true;
-		if (isLeftMode(mode)) {
+		if (mode === "left") {
 			// 左の確率がしきい値以上なら左、そうでなければ右
 			attempt.pLeft = data.pLeft;
 			attempt.direction = data.pLeft >= settings.leftThreshold ? "left" : "right";
@@ -235,14 +254,15 @@ async function requestDirection(pcm, offsetMs, mode) {
 		}
 		attempt.modelMs = data.latencyMs ?? null;
 	} catch (err) {
-		attempt.error = `通信エラー: ${err.message}`;
+		attempt.error =
+			err.name === "TimeoutError" ? `タイムアウト（${REQUEST_TIMEOUT_MS / 1000}秒）` : `通信エラー: ${err.message}`;
 	}
 	return attempt;
 }
 
 /** 3 択モードでは最低信頼度以上か。左判定モードは常に確定扱い */
 function isConfident(attempt) {
-	if (isLeftMode(attempt.mode)) return true;
+	if (attempt.mode === "left") return true;
 	return attempt.confidence === null || attempt.confidence >= settings.minConfidence;
 }
 
@@ -263,7 +283,7 @@ function pickBest(attempts) {
 const MAX_ENTRIES = 200;
 const LABELS = { right: "右", left: "左", none: "なし" };
 const TRUTH_LABELS = { right: "右", left: "左", none: "他" };
-const MODE_LABELS = { left: "左判定(noul)", "left-choice": "左判定(choice)", choice: "3択" };
+const MODE_LABELS = { left: "左判定", choice: "3択" };
 let entries = [];
 let nextId = 1;
 let selectedId = null;
@@ -285,6 +305,7 @@ function addEntry(fields) {
 		retrying: false,
 		mode: "choice",
 		pLeft: null,
+		ignored: null, // 判定は採用されたが車に反映しなかった理由
 		bestOffsetMs: 0,
 		...fields,
 	};
@@ -340,7 +361,8 @@ function renderRow(e) {
 		const rejected = !e.accepted && e.direction !== "none";
 		label = rejected ? `${name}（信頼度不足で無視）` : name;
 		if (e.accepted && e.bestOffsetMs > 0) label += "（再送で判定）";
-		cls = e.accepted ? e.direction : "none";
+		if (e.ignored) label += `（${e.ignored}のため無視）`;
+		cls = e.accepted && !e.ignored ? e.direction : "none";
 	}
 	const labelTd = cell(label, cls);
 	const outcome = outcomeOf(e);
@@ -391,6 +413,7 @@ function latencyByMode() {
 function renderSummary() {
 	const labeled = entries.filter((e) => e.truth && e.status === "done");
 	const latency = latencyByMode();
+	const ignoredCount = entries.filter((e) => e.ignored).length;
 	if (labeled.length === 0) {
 		summaryEl.textContent = latency ? `AI 処理時間: ${latency}` : "正解ラベル付きの判定はまだありません";
 		return;
@@ -442,6 +465,7 @@ function renderSummary() {
 		[`モデル判定そのものの正解率`, pct(rawCorrect, labeled.length), `（しきい値無視）`],
 		[`平均信頼度`, `正解時 ${avgConf(rawOk)} / 不正解時 ${avgConf(rawNg)}`, `（しきい値無視）`],
 		[`AI 処理時間`, latency, `（ラベルなしも含む）`],
+		[`遅延・順序逆転で車に反映しなかった判定`, `${ignoredCount} 件`, `（ラベルなしも含む。正解率は判定内容で集計）`],
 	];
 	for (const [head, value, tail] of lines) {
 		const div = document.createElement("div");
@@ -458,6 +482,7 @@ function showRaw(e) {
 			id: e.id,
 			time: e.time.toLocaleTimeString(),
 			mode: e.mode,
+			ignored: e.ignored,
 			gain: e.gain,
 			truth: e.truth,
 			error: e.error,
@@ -499,7 +524,7 @@ const EXPORT_HEADER = [
 	"time", "direction", "confidence", "accepted", "outcome", "truth", "correct",
 	"duration_ms", "gain", "round_trip_ms", "model_ms", "error", "answer_json",
 	"first_direction", "first_confidence", "first_outcome", "retries", "best_offset_ms", "attempts_json",
-	"mode", "p_left",
+	"mode", "p_left", "ignored",
 ];
 
 /** 古い順のエクスポート用行データ */
@@ -515,7 +540,7 @@ function exportRows() {
 			e.attempts.length > 1
 				? JSON.stringify(e.attempts.map((a) => ({ offset: a.offsetMs, choice: a.direction, confidence: a.confidence, probabilities: a.response?.probabilities, error: a.error ?? undefined })))
 				: "",
-			e.mode, e.pLeft,
+			e.mode, e.pLeft, e.ignored,
 		];
 	});
 }
