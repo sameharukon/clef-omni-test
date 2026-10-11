@@ -100,6 +100,37 @@ td.right { color: var(--ok); font-weight: 600; }
 td.left { color: var(--accent); font-weight: 600; }
 td.none, td.error { color: var(--muted); }
 
+.hint { margin: 0 0 6px; font-size: 0.8rem; color: var(--muted); }
+
+.summary {
+	font-size: 0.85rem;
+	padding: 8px;
+	background: var(--bg);
+	border-radius: 4px;
+	line-height: 1.6;
+}
+.summary strong { font-size: 1.1rem; }
+
+.log-actions { display: flex; gap: 8px; margin: 8px 0; }
+.log-actions button { flex: 0 0 auto; background: var(--panel); color: var(--fg); font-weight: 400; }
+
+.table-wrap { max-height: 360px; overflow: auto; }
+tbody tr { cursor: pointer; }
+tbody tr.selected { background: var(--bg); outline: 2px solid var(--accent); outline-offset: -2px; }
+
+.truth { display: flex; gap: 2px; }
+.truth button {
+	flex: 0 0 auto;
+	padding: 2px 6px;
+	font-size: 0.75rem;
+	font-weight: 400;
+	background: var(--panel);
+	color: var(--fg);
+}
+.truth button.on { background: var(--fg); color: var(--panel); font-weight: 600; }
+td.mark-ok::after { content: " ✓"; color: var(--ok); }
+td.mark-ng::after { content: " ✗"; color: var(--ng); }
+
 pre {
 	max-height: 200px;
 	overflow: auto;

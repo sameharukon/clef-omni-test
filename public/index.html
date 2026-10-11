@@ -32,15 +32,27 @@
 				<output id="thresholdValue">0.030</output></label>
 			<label>判定の最低信頼度 <input id="minConf" type="range" min="0" max="1" step="0.05" value="0.5" />
 				<output id="minConfValue">0.50</output></label>
+			<label><input id="normalize" type="checkbox" checked /> 送信前に音量を正規化する</label>
 			<p id="vadState" class="vad">待機中</p>
 
+			<h2>正解率</h2>
+			<p class="hint">各行の「正解」で実際に話した内容を選ぶと集計されます（「他」は右・左以外の発話や雑音）。</p>
+			<div id="summary" class="summary">正解ラベル付きの判定はまだありません</div>
+			<div class="log-actions">
+				<button id="copyBtn" type="button">ログをコピー</button>
+				<button id="csvBtn" type="button">CSV ダウンロード</button>
+				<button id="clearBtn" type="button">ログを消去</button>
+			</div>
+
 			<h2>判定ログ</h2>
-			<table>
-				<thead><tr><th>時刻</th><th>判定</th><th>信頼度</th><th>長さ</th><th>遅延</th></tr></thead>
-				<tbody id="log"></tbody>
-			</table>
-			<details>
-				<summary>直近のレスポンス (raw)</summary>
+			<div class="table-wrap">
+				<table>
+					<thead><tr><th>時刻</th><th>判定</th><th>信頼度</th><th>長さ</th><th>遅延</th><th>正解</th></tr></thead>
+					<tbody id="log"></tbody>
+				</table>
+			</div>
+			<details id="rawDetails">
+				<summary>選択中のレスポンス (raw) — 行をクリックで切り替え</summary>
 				<pre id="raw">-</pre>
 			</details>
 		</section>
