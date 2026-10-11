@@ -36,6 +36,20 @@ export function downsample(samples, fromRate, toRate) {
 	return out;
 }
 
+/**
+ * ピーク音量が targetPeak になるよう全体を増幅する（雑音を持ち上げすぎないよう maxGain で頭打ち）。
+ * 減衰はしない（gain >= 1）。
+ */
+export function normalizePeak(samples, targetPeak = 0.9, maxGain = 10) {
+	let peak = 0;
+	for (let i = 0; i < samples.length; i++) peak = Math.max(peak, Math.abs(samples[i]));
+	const gain = peak > 0 ? Math.min(maxGain, Math.max(1, targetPeak / peak)) : 1;
+	if (gain === 1) return { samples, gain };
+	const out = new Float32Array(samples.length);
+	for (let i = 0; i < samples.length; i++) out[i] = samples[i] * gain;
+	return { samples: out, gain };
+}
+
 /** モノラル 16bit PCM の WAV バイト列を作る */
 export function encodeWav(samples, sampleRate) {
 	const buffer = new ArrayBuffer(44 + samples.length * 2);

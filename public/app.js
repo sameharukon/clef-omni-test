@@ -1,4 +1,4 @@
-import { concatChunks, downsample, encodeWav, rms, toDataUrl } from "./audio.js";
+import { concatChunks, downsample, encodeWav, normalizePeak, rms, toDataUrl } from "./audio.js";
 
 // ---------------------------------------------------------------------------
 // 設定
@@ -27,6 +27,8 @@ const minConfEl = $("minConf");
 const vadStateEl = $("vadState");
 const logEl = $("log");
 const rawEl = $("raw");
+const summaryEl = $("summary");
+const normalizeEl = $("normalize");
 
 const settings = {
 	threshold: Number(thresholdEl.value),
@@ -135,9 +137,13 @@ function setVadState(text, speaking) {
 // Clef-omni への問い合わせ
 // ---------------------------------------------------------------------------
 async function sendUtterance(samples, sampleRate, durationMs) {
-	const wav = encodeWav(downsample(samples, sampleRate, TARGET_SAMPLE_RATE), TARGET_SAMPLE_RATE);
+	let pcm = downsample(samples, sampleRate, TARGET_SAMPLE_RATE);
+	let gain = 1;
+	if (normalizeEl.checked) ({ samples: pcm, gain } = normalizePeak(pcm));
+	const wav = encodeWav(pcm, TARGET_SAMPLE_RATE);
+
+	const entry = addEntry({ durationMs, gain, normalized: normalizeEl.checked });
 	const requestedAt = performance.now();
-	const row = addLogRow(durationMs);
 
 	try {
 		const res = await fetch("/api/direction", {
@@ -146,49 +152,252 @@ async function sendUtterance(samples, sampleRate, durationMs) {
 			body: JSON.stringify({ audio: toDataUrl(wav, "audio/wav") }),
 		});
 		const data = await res.json();
-		const roundTripMs = Math.round(performance.now() - requestedAt);
-		rawEl.textContent = JSON.stringify(data, null, 2);
+		entry.roundTripMs = Math.round(performance.now() - requestedAt);
+		entry.response = data;
 
 		if (!res.ok) {
-			updateLogRow(row, { label: data.error ?? `HTTP ${res.status}`, cls: "error", roundTripMs });
+			entry.status = "error";
+			entry.error = data.error ?? `HTTP ${res.status}`;
 			return;
 		}
 
-		const confidence = typeof data.confidence === "number" ? data.confidence : null;
-		const accepted =
+		entry.status = "done";
+		entry.direction = data.direction;
+		entry.confidence = typeof data.confidence === "number" ? data.confidence : null;
+		entry.modelMs = data.latencyMs ?? null;
+		entry.accepted =
 			(data.direction === "right" || data.direction === "left") &&
-			(confidence === null || confidence >= settings.minConfidence);
+			(entry.confidence === null || entry.confidence >= settings.minConfidence);
 
-		updateLogRow(row, {
-			label: { right: "右", left: "左", none: "なし" }[data.direction] ?? data.direction,
-			cls: accepted ? data.direction : "none",
-			confidence,
-			roundTripMs,
-			modelMs: data.latencyMs,
-			rejected: !accepted && data.direction !== "none",
-		});
-
-		if (accepted) moveCar(data.direction === "right" ? 1 : -1);
+		if (entry.accepted) moveCar(data.direction === "right" ? 1 : -1);
 	} catch (err) {
-		updateLogRow(row, { label: `通信エラー: ${err.message}`, cls: "error" });
+		entry.status = "error";
+		entry.error = `通信エラー: ${err.message}`;
+	} finally {
+		if (selectedId === entry.id) showRaw(entry);
+		render();
 	}
 }
 
-function addLogRow(durationMs) {
+// ---------------------------------------------------------------------------
+// 判定ログと正解率の集計
+// ---------------------------------------------------------------------------
+const MAX_ENTRIES = 200;
+const LABELS = { right: "右", left: "左", none: "なし" };
+const TRUTH_LABELS = { right: "右", left: "左", none: "他" };
+let entries = [];
+let nextId = 1;
+let selectedId = null;
+
+function addEntry(fields) {
+	const entry = {
+		id: nextId++,
+		time: new Date(),
+		status: "pending",
+		direction: null,
+		confidence: null,
+		accepted: false,
+		roundTripMs: null,
+		modelMs: null,
+		error: null,
+		response: null,
+		truth: null,
+		...fields,
+	};
+	entries.unshift(entry);
+	if (entries.length > MAX_ENTRIES) entries.length = MAX_ENTRIES;
+	render();
+	return entry;
+}
+
+/** ゲームに反映された結果（不採用は none 扱い） */
+function outcomeOf(e) {
+	if (e.status !== "done") return null;
+	return e.accepted ? e.direction : "none";
+}
+
+function render() {
+	logEl.replaceChildren(...entries.map(renderRow));
+	renderSummary();
+}
+
+function renderRow(e) {
 	const tr = document.createElement("tr");
-	tr.innerHTML = `<td>${new Date().toLocaleTimeString()}</td><td>判定中…</td><td>-</td><td>${Math.round(durationMs)}ms</td><td>-</td>`;
-	logEl.prepend(tr);
-	while (logEl.children.length > 30) logEl.lastElementChild.remove();
+	tr.dataset.id = String(e.id);
+	if (e.id === selectedId) tr.classList.add("selected");
+
+	const cell = (text, cls) => {
+		const td = document.createElement("td");
+		td.textContent = text;
+		if (cls) td.className = cls;
+		tr.append(td);
+		return td;
+	};
+
+	cell(e.time.toLocaleTimeString());
+
+	let label = "判定中…";
+	let cls = "";
+	if (e.status === "error") {
+		label = e.error;
+		cls = "error";
+	} else if (e.status === "done") {
+		const name = LABELS[e.direction] ?? e.direction;
+		const rejected = !e.accepted && e.direction !== "none";
+		label = rejected ? `${name}（信頼度不足で無視）` : name;
+		cls = e.accepted ? e.direction : "none";
+	}
+	const labelTd = cell(label, cls);
+	const outcome = outcomeOf(e);
+	if (e.truth && outcome) labelTd.classList.add(outcome === e.truth ? "mark-ok" : "mark-ng");
+
+	cell(e.confidence === null ? "-" : e.confidence.toFixed(2));
+	cell(`${Math.round(e.durationMs)}ms` + (e.gain > 1 ? ` ×${e.gain.toFixed(1)}` : ""));
+	cell(e.roundTripMs === null ? "-" : `${e.roundTripMs}ms` + (e.modelMs != null ? ` (AI ${e.modelMs}ms)` : ""));
+
+	const truthTd = cell("");
+	const group = document.createElement("div");
+	group.className = "truth";
+	for (const [value, text] of Object.entries(TRUTH_LABELS)) {
+		const btn = document.createElement("button");
+		btn.type = "button";
+		btn.textContent = text;
+		btn.dataset.truth = value;
+		if (e.truth === value) btn.classList.add("on");
+		group.append(btn);
+	}
+	truthTd.append(group);
 	return tr;
 }
 
-function updateLogRow(tr, { label, cls, confidence = null, roundTripMs = null, modelMs = null, rejected = false }) {
-	const [, labelTd, confTd, , latencyTd] = tr.children;
-	labelTd.textContent = rejected ? `${label}（信頼度不足で無視）` : label;
-	labelTd.className = cls;
-	confTd.textContent = confidence === null ? "-" : confidence.toFixed(2);
-	latencyTd.textContent = roundTripMs === null ? "-" : `${roundTripMs}ms` + (modelMs != null ? ` (AI ${modelMs}ms)` : "");
+function renderSummary() {
+	const labeled = entries.filter((e) => e.truth && e.status === "done");
+	if (labeled.length === 0) {
+		summaryEl.textContent = "正解ラベル付きの判定はまだありません";
+		return;
+	}
+
+	const pct = (n, d) => (d === 0 ? "-" : `${((n / d) * 100).toFixed(0)}%`);
+	const correct = labeled.filter((e) => outcomeOf(e) === e.truth).length;
+	const misfire = labeled.filter((e) => outcomeOf(e) !== "none" && outcomeOf(e) !== e.truth).length;
+	const missed = labeled.filter((e) => e.truth !== "none" && outcomeOf(e) === "none").length;
+	// しきい値を無視し、モデルの判定そのものが合っていたか（しきい値調整の参考）
+	const rawCorrect = labeled.filter((e) => e.direction === e.truth).length;
+
+	const perTruth = Object.entries(TRUTH_LABELS)
+		.map(([value, text]) => {
+			const group = labeled.filter((e) => e.truth === value);
+			const ok = group.filter((e) => outcomeOf(e) === value).length;
+			return group.length ? `${text} ${ok}/${group.length}` : null;
+		})
+		.filter(Boolean)
+		.join("　");
+
+	const avgConf = (list) => {
+		const values = list.map((e) => e.confidence).filter((c) => c !== null);
+		return values.length ? (values.reduce((a, b) => a + b, 0) / values.length).toFixed(2) : "-";
+	};
+	const rawOk = labeled.filter((e) => e.direction === e.truth);
+	const rawNg = labeled.filter((e) => e.direction !== e.truth);
+
+	summaryEl.innerHTML = "";
+	const lines = [
+		[`正解率`, `${pct(correct, labeled.length)}`, `（${correct}/${labeled.length} 件、判定時の最低信頼度を適用）`],
+		[`誤判定（逆方向・他を右左と判定）`, `${misfire} 件`, ""],
+		[`取りこぼし（右左を不採用・なし）`, `${missed} 件`, ""],
+		[`内訳`, perTruth, ""],
+		[`モデル判定そのものの正解率`, pct(rawCorrect, labeled.length), `（しきい値無視）`],
+		[`平均信頼度`, `正解時 ${avgConf(rawOk)} / 不正解時 ${avgConf(rawNg)}`, `（しきい値無視）`],
+	];
+	for (const [head, value, tail] of lines) {
+		const div = document.createElement("div");
+		const strong = document.createElement("strong");
+		strong.textContent = value;
+		div.append(`${head}: `, strong, tail);
+		summaryEl.append(div);
+	}
 }
+
+function showRaw(e) {
+	rawEl.textContent = JSON.stringify(
+		{ id: e.id, time: e.time.toLocaleTimeString(), gain: e.gain, truth: e.truth, error: e.error, response: e.response },
+		null,
+		2,
+	);
+}
+
+logEl.addEventListener("click", (ev) => {
+	const tr = ev.target.closest("tr");
+	if (!tr) return;
+	const entry = entries.find((e) => e.id === Number(tr.dataset.id));
+	if (!entry) return;
+
+	const btn = ev.target.closest("button[data-truth]");
+	if (btn) {
+		entry.truth = entry.truth === btn.dataset.truth ? null : btn.dataset.truth;
+	} else {
+		selectedId = entry.id;
+		$("rawDetails").open = true;
+	}
+	showRaw(entry);
+	render();
+});
+
+$("clearBtn").addEventListener("click", () => {
+	if (entries.length && !confirm("判定ログと集計を消去しますか？")) return;
+	entries = [];
+	selectedId = null;
+	rawEl.textContent = "-";
+	render();
+});
+
+const EXPORT_HEADER = [
+	"time", "direction", "confidence", "accepted", "outcome", "truth", "correct",
+	"duration_ms", "gain", "round_trip_ms", "model_ms", "error", "answer_json",
+];
+
+/** 古い順のエクスポート用行データ */
+function exportRows() {
+	return [...entries].reverse().map((e) => {
+		const outcome = outcomeOf(e);
+		return [
+			e.time.toISOString(), e.direction, e.confidence, e.accepted, outcome, e.truth,
+			e.truth && outcome ? outcome === e.truth : "",
+			Math.round(e.durationMs), e.gain.toFixed(2), e.roundTripMs, e.modelMs, e.error,
+			e.response?.raw ? JSON.stringify(e.response.raw) : "",
+		];
+	});
+}
+
+const str = (v) => (v === null || v === undefined ? "" : String(v));
+
+$("csvBtn").addEventListener("click", () => {
+	const escape = (v) => {
+		const s = str(v);
+		return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+	};
+	const csv = [EXPORT_HEADER, ...exportRows()].map((r) => r.map(escape).join(",")).join("\n");
+	const blob = new Blob(["﻿" + csv], { type: "text/csv" });
+	const a = document.createElement("a");
+	a.href = URL.createObjectURL(blob);
+	a.download = `clef-omni-log-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.csv`;
+	a.click();
+	URL.revokeObjectURL(a.href);
+});
+
+$("copyBtn").addEventListener("click", async (ev) => {
+	const summaryText = [...summaryEl.children].map((div) => div.textContent).join("\n") || summaryEl.textContent;
+	const tsv = [EXPORT_HEADER, ...exportRows()].map((r) => r.map((v) => str(v).replace(/[\t\n]/g, " ")).join("\t")).join("\n");
+	const text = `${summaryText}\n\n${tsv}`;
+	const btn = ev.currentTarget;
+	try {
+		await navigator.clipboard.writeText(text);
+		btn.textContent = "コピーしました";
+	} catch {
+		btn.textContent = "コピーに失敗しました";
+	}
+	setTimeout(() => (btn.textContent = "ログをコピー"), 1500);
+});
 
 // ---------------------------------------------------------------------------
 // 3 レーンの車ゲーム
@@ -291,7 +500,7 @@ function draw() {
 		ctx.fillStyle = "rgba(0,0,0,0.45)";
 		ctx.fillRect(0, canvas.height / 2 - 30, canvas.width, 60);
 		ctx.fillStyle = "#fff";
-		ctx.font = "bold 20px system-ui, sans-serif";
+		ctx.font = "bold 16px system-ui, sans-serif";
 		ctx.textAlign = "center";
 		ctx.fillText(game.over ? `GAME OVER  スコア ${game.score}` : "「ゲーム開始」を押してください", canvas.width / 2, canvas.height / 2 + 7);
 	}
